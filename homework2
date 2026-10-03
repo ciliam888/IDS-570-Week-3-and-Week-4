@@ -1,0 +1,116 @@
+library(tidyverse)
+library(tidytext)
+library(quanteda)
+
+# Read the three texts
+txt <- c(
+  "Circle_of_Commerce" = read_file("texts/A07594__Circle_of_Commerce.txt"),
+  "Free_Trade"         = read_file("texts/B14801__Free_Trade.txt"),
+  "Third_Text_A06785"  = read_file("texts/A06785.txt")
+)
+
+txt <- str_replace_all(txt, "ſ", "s")   # long s becomes s
+
+# One cleaning pipeline (Week 04 choices), used for both analyses
+custom_stop <- c("vnto","haue","doo","hath","bee","ye","thee","hee","shall",
+                 "hast","doe","beene","thereof","thus")
+
+toks <- corpus(txt) %>%
+  tokens(remove_punct = TRUE, remove_numbers = TRUE, remove_symbols = TRUE) %>%
+  tokens_tolower() %>%
+  tokens_remove(c(stopwords("en"), custom_stop))
+
+bing <- get_sentiments("bing")   # sentiment dictionary
+
+# Part I: raw-count sentiment (Steps 1-3) ----
+
+# Step 1: one row per word token, all three texts
+tokens_tidy <- tibble(
+  document = rep(names(toks), times = ntoken(toks)),
+  word     = unlist(as.list(toks), use.names = FALSE)
+)
+
+# Steps 2-3: join to Bing, count, one row per document (Texts A and B only)
+raw_summary <- tokens_tidy %>%
+  filter(document != "Third_Text_A06785") %>%
+  inner_join(bing, by = "word", relationship = "many-to-many") %>%
+  count(document, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n,
+              values_fill = 0, names_prefix = "raw_") %>%
+  mutate(raw_net = raw_positive - raw_negative)
+
+raw_summary
+
+# Part II: TF-IDF-weighted sentiment (Steps 4-7) ----
+
+# Step 4: TF-IDF on all 3 docs and the full vocabulary
+dfm_mat   <- dfm(toks)
+tfidf_dfm <- dfm_tfidf(dfm_mat)
+
+# Step 5: back to a tidy table; drop zero weights and the third text
+tfidf_tidy <- convert(tfidf_dfm, to = "data.frame") %>%
+  pivot_longer(-doc_id, names_to = "word", values_to = "tfidf") %>%
+  rename(document = doc_id) %>%
+  filter(tfidf > 0, document != "Third_Text_A06785")
+
+# Step 6: keep only Bing words (join after computing TF-IDF)
+tfidf_sent <- tfidf_tidy %>%
+  inner_join(bing, by = "word", relationship = "many-to-many")
+
+# Top 10 sentiment words per document 
+tfidf_sent %>%
+  group_by(document) %>%
+  slice_max(tfidf, n = 10, with_ties = FALSE) %>%
+  print(n = Inf)
+
+# Step 7: sum TF-IDF weights, one row per document
+tfidf_summary <- tfidf_sent %>%
+  group_by(document, sentiment) %>%
+  summarise(w = sum(tfidf), .groups = "drop") %>%
+  pivot_wider(names_from = sentiment, values_from = w,
+              values_fill = 0, names_prefix = "tfidf_") %>%
+  mutate(tfidf_net = tfidf_positive - tfidf_negative)
+
+# Part III: comparison table and CSV ----
+
+final_table <- raw_summary %>%
+  left_join(tfidf_summary, by = "document")
+
+final_table   # should have exactly 2 rows
+
+write_csv(final_table, "sentiment_comparison.csv")
+
+# Supporting checks (Questions 2-4, not in the CSV) ----
+# Words that dominate raw counts. NA in tfidf = zero weight (word in all 3 texts)
+raw_words <- tokens_tidy %>%
+  filter(document != "Third_Text_A06785") %>%
+  inner_join(bing, by = "word", relationship = "many-to-many") %>%
+  count(document, word, sentiment, sort = TRUE)
+
+raw_vs_tfidf <- raw_words %>%
+  left_join(tfidf_sent %>% select(document, word, tfidf),
+            by = c("document", "word"))
+
+# Top 10 raw words per document and their TF-IDF weight
+raw_vs_tfidf %>%
+  group_by(document) %>%
+  slice_max(n, n = 10, with_ties = FALSE) %>%
+  print(n = Inf)
+
+# Share of raw sentiment words that get zero TF-IDF weight 
+raw_vs_tfidf %>%
+  group_by(document) %>%
+  summarise(total_raw   = sum(n),
+            zero_weight = sum(n[is.na(tfidf)]),
+            share       = zero_weight / total_raw)
+
+# Document length and the raw-count measure 
+token_counts <- tibble(
+  document = names(ntoken(toks)),
+  tokens   = as.numeric(ntoken(toks))
+)
+
+raw_summary %>%
+  left_join(token_counts, by = "document") %>%
+  mutate(raw_net_per_1000 = raw_net / tokens * 1000)
+
